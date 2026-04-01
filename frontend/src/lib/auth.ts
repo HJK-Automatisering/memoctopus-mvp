@@ -13,6 +13,7 @@ export const auth = betterAuth({
     "http://127.0.0.1:3000",
     "https://pedro.sikkerai.dk",
     "http://10.1.3.10:6767",
+    process.env["BETTER_AUTH_URL"] || "http://localhost:3000"
   ],
   emailAndPassword: {
     enabled: true,
