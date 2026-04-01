@@ -7,16 +7,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install everything in one pass so pip resolves torch only once
-# (nemo/pyannote may pull a newer torch than the cu124 index default,
-#  a two-step install causes a double download that can exhaust disk)
+# 1. Install PyTorch using the CUDA 12.8 index (Supported by your 570 driver)
+# Note: TorchVision 0.22.0 might be 0.26.0 in the 2.11.0 release; 
+# letting pip pick the companion versions is safer.
+RUN pip install --no-cache-dir \
+    torch==2.11.0+cu128 \
+    torchvision \
+    torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# 2. Install the application dependencies
 RUN pip install --no-cache-dir \
     'nemo_toolkit[asr]' \
-    'pyannote.audio' \
+    'pyannote.audio==3.1.1' \
     fastapi \
     'uvicorn[standard]' \
     python-multipart \
-    --extra-index-url https://download.pytorch.org/whl/cu124
+    --extra-index-url https://download.pytorch.org/whl/cu128
 
 COPY main.py .
 
