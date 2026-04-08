@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.10-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -12,7 +12,7 @@ WORKDIR /app
 #  a two-step install causes a double download that can exhaust disk)
 RUN pip install --no-cache-dir \
     'nemo_toolkit[asr]' \
-    'pyannote.audio' \
+    pyannote.audio==3.1.1 \
     fastapi \
     'uvicorn[standard]' \
     python-multipart \
