@@ -11,6 +11,12 @@ function getClient() {
 }
 const LLM_MODEL = process.env.LLM_MODEL || 'Qwen/Qwen3.6-27B';
 
+// Output cap for the chapter JSON: at most 14 chapters, each a title plus a
+// one-or-two sentence summary. Without it the model is handed whatever remains
+// of the context window, and a long transcript leaves too little to finish the
+// JSON — which surfaces as a parse failure in the catch below, not as an error.
+const CHAPTERS_MAX_OUTPUT_TOKENS = 2_000;
+
 export interface TranscriptChapter {
   id: string;
   title: string;
@@ -39,6 +45,7 @@ export async function groupIntoChapters(segments: TranscriptSegment[]): Promise<
 
   const response = await getClient().chat.completions.create({
     model: LLM_MODEL,
+    max_tokens: CHAPTERS_MAX_OUTPUT_TOKENS,
     messages: [
       {
         role: 'user',

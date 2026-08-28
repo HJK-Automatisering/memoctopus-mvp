@@ -8,7 +8,12 @@ vi.mock('openai', () => ({
   },
 }));
 
-import { generateReferatBody, buildSkabelonInstruction, SkabelonSpec } from './minutes';
+import {
+  generateReferatBody,
+  buildSkabelonInstruction,
+  mergeConsecutiveSpeakerTurns,
+  SkabelonSpec,
+} from './minutes';
 import type { TranscriptSegment } from '@/types';
 
 const sampleSegments: TranscriptSegment[] = [
@@ -127,5 +132,65 @@ describe('generateReferatBody', () => {
     await generateReferatBody(sampleSegments, baseSpec);
 
     expect(mockComplete.mock.calls[0][0].model).toBe(process.env.LLM_MODEL ?? 'Qwen/Qwen3.6-27B');
+  });
+});
+
+// ─── mergeConsecutiveSpeakerTurns ─────────────────────────────────────────────
+
+describe('mergeConsecutiveSpeakerTurns', () => {
+  it('joins a run of same-speaker segments into one turn and leaves the input untouched', () => {
+    const segments: TranscriptSegment[] = [
+      { speaker: 'Taler 1', start: 0, end: 4, text: 'Vi åbner mødet.' },
+      { speaker: 'Taler 1', start: 4, end: 9, text: 'Første punkt.' },
+      { speaker: 'Taler 2', start: 9, end: 12, text: 'Enig.' },
+    ];
+
+    const turns = mergeConsecutiveSpeakerTurns(segments);
+
+    expect(turns).toEqual([
+      { speaker: 'Taler 1', start: 0, end: 9, text: 'Vi åbner mødet. Første punkt.' },
+      { speaker: 'Taler 2', start: 9, end: 12, text: 'Enig.' },
+    ]);
+    // The caller's segments must survive — they are rendered elsewhere in the UI.
+    expect(segments).toHaveLength(3);
+    expect(segments[0].text).toBe('Vi åbner mødet.');
+  });
+});
+
+// ─── transcript budget trigger ────────────────────────────────────────────────
+
+describe('generateReferatBody chapter-summarisation trigger', () => {
+  beforeEach(() => mockComplete.mockReset());
+
+  // Alternating speakers so merging cannot collapse the transcript below the budget.
+  const longTranscript: TranscriptSegment[] = Array.from({ length: 200 }, (_, i) => ({
+    speaker: `Taler ${(i % 2) + 1}`,
+    start: i * 10,
+    end: i * 10 + 10,
+    text: 'Vi diskuterede budgettet for det kommende år i detaljer. '.repeat(4),
+  }));
+
+  const twoChapters = [
+    { id: 'ch-0', title: 'Budget', summary: '', startTime: 0, endTime: 1000,
+      segmentIndices: Array.from({ length: 100 }, (_, i) => i) },
+    { id: 'ch-1', title: 'Personale', summary: '', startTime: 1000, endTime: 2000,
+      segmentIndices: Array.from({ length: 100 }, (_, i) => i + 100) },
+  ];
+
+  it('summarises per chapter when the merged transcript exceeds the char budget', async () => {
+    mockComplete.mockResolvedValue(openaiResponse('- punkt'));
+
+    await generateReferatBody(longTranscript, baseSpec, undefined, twoChapters);
+
+    // Two chapter summaries plus the final referat.
+    expect(mockComplete).toHaveBeenCalledTimes(3);
+  });
+
+  it('stays single-shot when the transcript is within the char budget', async () => {
+    mockComplete.mockResolvedValue(openaiResponse('referat'));
+
+    await generateReferatBody(sampleSegments, baseSpec, undefined, twoChapters);
+
+    expect(mockComplete).toHaveBeenCalledTimes(1);
   });
 });

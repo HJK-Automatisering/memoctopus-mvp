@@ -24,8 +24,28 @@ Brugerens instruktioner og de ønskede afsnit er styrende: følg dem nøje — o
 
 Du skriver referatet som ét sammenhængende dokument i markdown.`;
 
-// Transcript char length above which per-chapter summarisation is used (~30–60 min meeting)
-const CHAPTER_SPLIT_THRESHOLD = 20_000;
+// Budget for the transcript portion of a minutes prompt, derived rather than guessed:
+//
+//    16_384  model context (google/gemma-4-26B-A4B-it, maxModelLen in the vLLM chart)
+//  −  2_000  reserved for the generated referat
+//  −  1_000  reserved for MINUTES_SYSTEM_PROMPT, the skabelon instruction and wrapper text
+//  = 13_384  tokens available for transcript
+//
+// Danish tokenizes poorly on this model: measured 2.97 chars/token on merged transcript
+// text, 2.33 unmerged. We divide by a deliberately pessimistic 2.5 — names, numbers and
+// loanwords tokenize worse than the sampled text, and summarising a transcript that would
+// have fit costs some quality, whereas exceeding the window costs the entire request.
+const MODEL_CONTEXT_TOKENS = 16_384;
+const RESERVED_OUTPUT_TOKENS = 2_000;
+const RESERVED_PROMPT_TOKENS = 1_000;
+const PESSIMISTIC_CHARS_PER_TOKEN = 2.5;
+const TRANSCRIPT_CHAR_BUDGET =
+  (MODEL_CONTEXT_TOKENS - RESERVED_OUTPUT_TOKENS - RESERVED_PROMPT_TOKENS) *
+  PESSIMISTIC_CHARS_PER_TOKEN;
+
+// Output caps, so the model is never handed "whatever is left of the window".
+const MINUTES_MAX_OUTPUT_TOKENS = RESERVED_OUTPUT_TOKENS;
+const CHAPTER_SUMMARY_MAX_OUTPUT_TOKENS = 600;
 
 // The generation-relevant subset of a Skabelon.
 export interface SkabelonSpec {
@@ -76,11 +96,36 @@ export function buildSkabelonInstruction(
   return parts.join('\n\n');
 }
 
+/**
+ * Collapse runs of consecutive segments from the same speaker into one turn.
+ *
+ * hviske emits short utterances, so one person speaking for a minute arrives as many
+ * segments, each repeating the `[Taler N] (mm:ss): ` prefix. On a measured 57-minute
+ * meeting that was 982 segments versus 126 actual turns — 37% of the prompt's characters
+ * and roughly half its tokens spent on labels rather than speech.
+ *
+ * Returns new objects; the caller's segments are not mutated.
+ */
+export function mergeConsecutiveSpeakerTurns(segments: TranscriptSegment[]): TranscriptSegment[] {
+  const turns: TranscriptSegment[] = [];
+  for (const segment of segments) {
+    const previous = turns[turns.length - 1];
+    if (previous && previous.speaker === segment.speaker) {
+      previous.text = `${previous.text} ${segment.text}`.trim();
+      previous.end = segment.end;
+    } else {
+      turns.push({ ...segment });
+    }
+  }
+  return turns;
+}
+
 // ─── Generation ───────────────────────────────────────────────────────────────
 
 async function _generateBody(transcriptText: string, instruction: string): Promise<string> {
   const response = await getClient().chat.completions.create({
     model: LLM_MODEL,
+    max_tokens: MINUTES_MAX_OUTPUT_TOKENS,
     messages: [
       { role: 'system', content: MINUTES_SYSTEM_PROMPT },
       {
@@ -107,10 +152,13 @@ async function _summarizeChapter(
   chapterSegments: TranscriptSegment[],
   chapterTitle: string,
 ): Promise<string> {
-  const transcriptText = chapterSegments.map((s) => `[${s.speaker}]: ${s.text}`).join('\n');
+  const transcriptText = mergeConsecutiveSpeakerTurns(chapterSegments)
+    .map((s) => `[${s.speaker}]: ${s.text}`)
+    .join('\n');
 
   const response = await getClient().chat.completions.create({
     model: LLM_MODEL,
+    max_tokens: CHAPTER_SUMMARY_MAX_OUTPUT_TOKENS,
     messages: [
       {
         role: 'user',
@@ -139,12 +187,12 @@ export async function generateReferatBody(
   chapters?: TranscriptChapter[],
   customPrompt?: string,
 ): Promise<{ body: string }> {
-  const transcriptText = transcript
+  const transcriptText = mergeConsecutiveSpeakerTurns(transcript)
     .map((s) => `[${s.speaker}] (${formatTime(s.start)}): ${s.text}`)
     .join('\n');
   const instruction = buildSkabelonInstruction(spec, participants, customPrompt);
 
-  if (chapters && chapters.length > 1 && transcriptText.length > CHAPTER_SPLIT_THRESHOLD) {
+  if (chapters && chapters.length > 1 && transcriptText.length > TRANSCRIPT_CHAR_BUDGET) {
     const summaries = await Promise.all(
       chapters.map((ch) => {
         const chapterSegments = ch.segmentIndices.map((i) => transcript[i]).filter(Boolean);
