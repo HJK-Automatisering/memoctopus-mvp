@@ -188,7 +188,7 @@ describe('groupIntoChapters', () => {
     expect(result[0].title).toBe('T');
   });
 
-  it('uses configured LLM model', async () => {
+  it('uses gpt-4o model', async () => {
     mockComplete.mockResolvedValueOnce(
       openaiResponse(JSON.stringify({ chapters: [{ startIndex: 0, title: 'T', summary: 'S' }] })),
     );
@@ -196,7 +196,7 @@ describe('groupIntoChapters', () => {
     await groupIntoChapters(shortMeeting);
 
     const call = mockComplete.mock.calls[0][0];
-    expect(call.model).toBe(process.env.LLM_MODEL ?? 'Qwen/Qwen3.6-27B');
+    expect(call.model).toBe('gpt-4o');
   });
 
   it('includes segment indices in the prompt', async () => {
