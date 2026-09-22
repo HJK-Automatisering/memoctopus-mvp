@@ -31,7 +31,8 @@ const longMeeting: TranscriptSegment[] = Array.from({ length: 30 }, (_, i) => ({
 // ─── groupIntoChapters ────────────────────────────────────────────────────────
 
 describe('groupIntoChapters', () => {
-  beforeEach(() => mockComplete.mockReset());
+  // A key is configured, so the LLM selector targets hosted OpenAI (gpt-4o).
+  beforeEach(() => { process.env.OPENAI_API_KEY = 'sk-test'; mockComplete.mockReset(); });
 
   it('returns empty array for empty segments', async () => {
     const result = await groupIntoChapters([]);
@@ -150,6 +151,32 @@ describe('groupIntoChapters', () => {
     expect(result[0].segmentIndices).toEqual([0, 1, 2]);
   });
 
+  it('logs an error when JSON parsing fails on the fallback path', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockComplete.mockResolvedValueOnce(openaiResponse('not valid json at all'));
+
+    await groupIntoChapters(shortMeeting);
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[chapters] parse failed'),
+      expect.any(Error),
+    );
+    errorSpy.mockRestore();
+  });
+
+  it('logs an error when response contains no JSON object', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockComplete.mockResolvedValueOnce(openaiResponse('no json here'));
+
+    await groupIntoChapters(shortMeeting);
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[chapters] parse failed'),
+      expect.any(Error),
+    );
+    errorSpy.mockRestore();
+  });
+
   it('strips markdown code fences before parsing', async () => {
     mockComplete.mockResolvedValueOnce(
       openaiResponse(
@@ -161,7 +188,7 @@ describe('groupIntoChapters', () => {
     expect(result[0].title).toBe('T');
   });
 
-  it('uses configured LLM model', async () => {
+  it('uses gpt-4o model', async () => {
     mockComplete.mockResolvedValueOnce(
       openaiResponse(JSON.stringify({ chapters: [{ startIndex: 0, title: 'T', summary: 'S' }] })),
     );
@@ -169,7 +196,7 @@ describe('groupIntoChapters', () => {
     await groupIntoChapters(shortMeeting);
 
     const call = mockComplete.mock.calls[0][0];
-    expect(call.model).toBe(process.env.LLM_MODEL ?? 'Qwen/Qwen3.6-27B');
+    expect(call.model).toBe('gpt-4o');
   });
 
   it('includes segment indices in the prompt', async () => {

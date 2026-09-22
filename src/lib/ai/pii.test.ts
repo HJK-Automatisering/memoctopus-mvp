@@ -17,7 +17,8 @@ function openaiResponse(content: string) {
 // ─── removePii ────────────────────────────────────────────────────────────────
 
 describe('removePii', () => {
-  beforeEach(() => mockComplete.mockReset());
+  // A key is configured, so the LLM selector targets hosted OpenAI (gpt-4o).
+  beforeEach(() => { process.env.OPENAI_API_KEY = 'sk-test'; mockComplete.mockReset(); });
 
   it('returns cleanedText and replacements from a valid response', async () => {
     mockComplete.mockResolvedValueOnce(
@@ -56,6 +57,21 @@ describe('removePii', () => {
     const result = await removePii('original text');
     expect(result.cleanedText).toBe('original text');
     expect(result.replacements).toHaveLength(0);
+  });
+
+  it('logs the raw response and bound error on parse failure', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockComplete.mockResolvedValueOnce(openaiResponse('totally invalid json'));
+
+    await removePii('something');
+
+    expect(errorSpy).toHaveBeenCalledOnce();
+    const [label, raw, err] = errorSpy.mock.calls[0];
+    expect(label).toBe('[pii] parse failed. raw:');
+    expect(raw).toBe('totally invalid json');
+    expect(err).toBeInstanceOf(SyntaxError);
+
+    errorSpy.mockRestore();
   });
 
   it('falls back to original text when response content is empty', async () => {
@@ -142,7 +158,7 @@ describe('removePii', () => {
     expect(call.messages[0].content).toContain('GDPR');
   });
 
-  it('uses configured LLM model', async () => {
+  it('uses gpt-4o model', async () => {
     mockComplete.mockResolvedValueOnce(
       openaiResponse(JSON.stringify({ cleanedText: 'x', replacements: [] })),
     );
@@ -150,7 +166,7 @@ describe('removePii', () => {
     await removePii('anything');
 
     const call = mockComplete.mock.calls[0][0];
-    expect(call.model).toBe(process.env.LLM_MODEL ?? 'Qwen/Qwen3.6-27B');
+    expect(call.model).toBe('gpt-4o');
   });
 });
 

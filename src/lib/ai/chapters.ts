@@ -1,15 +1,5 @@
-import OpenAI from 'openai';
 import { TranscriptSegment } from '@/types';
-
-let client: OpenAI | null = null;
-function getClient() {
-  if (!client) client = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY || 'no-key',
-    baseURL: process.env.LLM_BASE_URL || 'http://vllm-chat:8000/v1',
-  });
-  return client;
-}
-const LLM_MODEL = process.env.LLM_MODEL || 'Qwen/Qwen3.6-27B';
+import { getLlmClient, llmModel } from './llm-client';
 
 // Output cap for the chapter JSON: at most 14 chapters, each a title plus a
 // one-or-two sentence summary. Without it the model is handed whatever remains
@@ -43,8 +33,8 @@ export async function groupIntoChapters(segments: TranscriptSegment[]): Promise<
     .map((s, i) => `[${i}] ${fmt(s.start)} [${s.speaker}]: ${s.text}`)
     .join('\n');
 
-  const response = await getClient().chat.completions.create({
-    model: LLM_MODEL,
+  const response = await getLlmClient().chat.completions.create({
+    model: llmModel('gpt-4o'),
     max_tokens: CHAPTERS_MAX_OUTPUT_TOKENS,
     messages: [
       {
@@ -118,7 +108,8 @@ Regler:
     }
 
     return chapters;
-  } catch {
+  } catch (err) {
+    console.error('[chapters] parse failed, using fallback:', err);
     return [
       {
         id: 'ch-0',
