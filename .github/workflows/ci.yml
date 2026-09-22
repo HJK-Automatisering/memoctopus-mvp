@@ -15,12 +15,16 @@ jobs:
       BETTER_AUTH_TRUSTED_ORIGINS: http://localhost:3000
       OPENAI_API_KEY: no-key
       LLM_BASE_URL: http://localhost:8000/v1
-      LLM_MODEL: ci-model
+      # LLM_MODEL must stay unset: upstream's chapters/minutes/pii tests assert the
+      # gpt-4o fallback; the env override is covered by llm-client.test.ts.
       HVISKE_URL: http://localhost:8001/v1
       HVISKE_API_KEY: no-key
       HVISKE_MODEL: syvai/hviske-v5.1
       ASR_LANGUAGE: da
       NEXT_PUBLIC_APP_URL: http://localhost:3000
+      # Match the app's Danish locale; upstream's VersionHistory date-label test
+      # renders 2024-12-31T23:59Z into 2025 only in a UTC+1 timezone.
+      TZ: Europe/Copenhagen
 
     steps:
       - name: Checkout
