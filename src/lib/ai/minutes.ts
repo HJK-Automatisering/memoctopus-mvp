@@ -1,6 +1,10 @@
 import { TranscriptSegment } from '@/types';
 import { TranscriptChapter } from '@/lib/ai/chapters';
 import { getLlmClient, llmModel } from './llm-client';
+import { getLlmLimits, transcriptBudgetChars } from './llm-limits';
+import { mapWithLimit } from './map-with-limit';
+import { MinutesConfigError, MinutesTooLongError, MinutesTruncatedError } from './minutes-errors';
+import { mergeSpeakerTurns, renderTurns, splitTurns, type Turn } from './transcript-text';
 
 const MINUTES_SYSTEM_PROMPT = `Du er en dansk mødesekretær der udarbejder professionelle mødereferater.
 
@@ -14,28 +18,20 @@ Brugerens instruktioner og de ønskede afsnit er styrende: følg dem nøje — o
 
 Du skriver referatet som ét sammenhængende dokument i markdown.`;
 
-// Budget for the transcript portion of a minutes prompt, derived rather than guessed:
-//
-//    16_384  model context (google/gemma-4-26B-A4B-it, maxModelLen in the vLLM chart)
-//  −  2_000  reserved for the generated referat
-//  −  1_000  reserved for MINUTES_SYSTEM_PROMPT, the skabelon instruction and wrapper text
-//  = 13_384  tokens available for transcript
-//
-// Danish tokenizes poorly on this model: measured 2.97 chars/token on merged transcript
-// text, 2.33 unmerged. We divide by a deliberately pessimistic 2.5 — names, numbers and
-// loanwords tokenize worse than the sampled text, and summarising a transcript that would
-// have fit costs some quality, whereas exceeding the window costs the entire request.
-const MODEL_CONTEXT_TOKENS = 16_384;
-const RESERVED_OUTPUT_TOKENS = 2_000;
-const RESERVED_PROMPT_TOKENS = 1_000;
-const PESSIMISTIC_CHARS_PER_TOKEN = 2.5;
-const TRANSCRIPT_CHAR_BUDGET =
-  (MODEL_CONTEXT_TOKENS - RESERVED_OUTPUT_TOKENS - RESERVED_PROMPT_TOKENS) *
-  PESSIMISTIC_CHARS_PER_TOKEN;
+// Transcript char length above which per-chapter summarisation is used (~30–60 min meeting)
+const CHAPTER_SPLIT_THRESHOLD = 20_000;
 
-// Output caps, so the model is never handed "whatever is left of the window".
-const MINUTES_MAX_OUTPUT_TOKENS = RESERVED_OUTPUT_TOKENS;
-const CHAPTER_SUMMARY_MAX_OUTPUT_TOKENS = 600;
+// At most this many summarise passes (the first counts as pass 1) before giving up.
+const MAX_SUMMARY_ROUNDS = 3;
+
+// Concurrent summary calls. The bundled vLLM runs with --max-num-seqs 4.
+const SUMMARY_CONCURRENCY = 3;
+
+// Output cap for a per-part summary (max 8 bullet points).
+const SUMMARY_MAX_OUTPUT_TOKENS = 1_024;
+
+// Below this many characters of transcript budget the configuration cannot work.
+const MIN_TRANSCRIPT_BUDGET_CHARS = 4_000;
 
 // The generation-relevant subset of a Skabelon.
 export interface SkabelonSpec {
@@ -86,50 +82,37 @@ export function buildSkabelonInstruction(
   return parts.join('\n\n');
 }
 
-/**
- * Collapse runs of consecutive segments from the same speaker into one turn.
- *
- * hviske emits short utterances, so one person speaking for a minute arrives as many
- * segments, each repeating the `[Taler N] (mm:ss): ` prefix. On a measured 57-minute
- * meeting that was 982 segments versus 126 actual turns — 37% of the prompt's characters
- * and roughly half its tokens spent on labels rather than speech.
- *
- * Returns new objects; the caller's segments are not mutated.
- */
-export function mergeConsecutiveSpeakerTurns(segments: TranscriptSegment[]): TranscriptSegment[] {
-  const turns: TranscriptSegment[] = [];
-  for (const segment of segments) {
-    const previous = turns[turns.length - 1];
-    if (previous && previous.speaker === segment.speaker) {
-      previous.text = `${previous.text} ${segment.text}`.trim();
-      previous.end = segment.end;
-    } else {
-      turns.push({ ...segment });
-    }
-  }
-  return turns;
-}
-
 // ─── Generation ───────────────────────────────────────────────────────────────
 
-async function _generateBody(transcriptText: string, instruction: string): Promise<string> {
-  const response = await getLlmClient().chat.completions.create({
-    model: llmModel('gpt-4o'),
-    max_tokens: MINUTES_MAX_OUTPUT_TOKENS,
-    messages: [
-      { role: 'system', content: MINUTES_SYSTEM_PROMPT },
-      {
-        role: 'user',
-        content: `Udarbejd et mødereferat baseret på denne transskription.
+// Keep the transcript last: also called with '' to measure the fixed part of the prompt.
+function buildBodyPrompt(transcriptText: string, instruction: string): string {
+  return `Udarbejd et mødereferat baseret på denne transskription.
 ${instruction ? `\n${instruction}\n` : ''}
 Følg instruktionerne ovenfor nøje — herunder ønsket længde og hvilke afsnit der skal med. Skriv referatet som ét sammenhængende dokument i markdown. Brug overskrifter (##) til afsnit og punktlister hvor det er relevant. Returner KUN selve referatet — ingen forklaringer, ingen JSON og ingen code blocks.
 
 Transskription:
-${transcriptText}`,
-      },
+${transcriptText}`;
+}
+
+async function _generateBody(
+  transcriptText: string,
+  instruction: string,
+  maxOutputTokens: number,
+): Promise<string> {
+  const response = await getLlmClient().chat.completions.create({
+    model: llmModel('gpt-4o'),
+    max_tokens: maxOutputTokens,
+    messages: [
+      { role: 'system', content: MINUTES_SYSTEM_PROMPT },
+      { role: 'user', content: buildBodyPrompt(transcriptText, instruction) },
     ],
   });
 
+  // A call that runs out of output tokens returns a cut-off document with no error. Never
+  // hand that to the user as if it were a complete referat.
+  if (response.choices[0]?.finish_reason === 'length') {
+    throw new MinutesTruncatedError('The model hit its output limit while writing the referat');
+  }
   const raw = response.choices[0]?.message?.content ?? '';
   // Strip an accidental markdown code fence if the model wraps the document.
   return raw
@@ -138,37 +121,64 @@ ${transcriptText}`,
     .trim();
 }
 
-async function _summarizeChapter(
-  chapterSegments: TranscriptSegment[],
-  chapterTitle: string,
-): Promise<string> {
-  const transcriptText = mergeConsecutiveSpeakerTurns(chapterSegments)
-    .map((s) => `[${s.speaker}]: ${s.text}`)
-    .join('\n');
+// Keep the text last: also called with '' to measure the fixed part of the prompt.
+function buildSummaryPrompt(text: string, title: string): string {
+  return `Opsummer mødeafsnittet "${title}" i korte punkter på dansk (max 8 punkter). Fokus på beslutninger, aftaler og vigtige diskussionspunkter.
 
+${text}
+
+Returner kun en punktliste.`;
+}
+
+async function _summarizePart(text: string, title: string): Promise<string> {
   const response = await getLlmClient().chat.completions.create({
     model: llmModel('gpt-4o'),
-    max_tokens: CHAPTER_SUMMARY_MAX_OUTPUT_TOKENS,
-    messages: [
-      {
-        role: 'user',
-        content: `Opsummer mødekapitlet "${chapterTitle}" i korte punkter på dansk (max 8 punkter). Fokus på beslutninger, aftaler og vigtige diskussionspunkter.
-
-${transcriptText}
-
-Returner kun en punktliste.`,
-      },
-    ],
+    max_tokens: SUMMARY_MAX_OUTPUT_TOKENS,
+    messages: [{ role: 'user', content: buildSummaryPrompt(text, title) }],
   });
 
+  // A summary cut off at its cap is still a usable (slightly shorter) bullet list, and it
+  // is only an input to the referat — failing the whole meeting over it would be worse.
+  if (response.choices[0]?.finish_reason === 'length') {
+    console.warn(`[minutes] summary of "${title}" hit its ${SUMMARY_MAX_OUTPUT_TOKENS}-token cap`);
+  }
   return response.choices[0]?.message?.content?.trim() ?? '';
+}
+
+// A stretch of the meeting to summarise: a chapter, or the whole transcript.
+interface Unit {
+  title: string;
+  turns: Turn[];
+}
+
+// Summarise every unit, splitting any unit larger than `budget` into parts. Returns one
+// markdown section per part, in meeting order. A unit with no turns (an agenda topic
+// nothing was assigned to) still gets its heading, with an empty body — every chapter
+// appears in the condensed text, even one nothing was said under.
+async function _summarizeUnits(units: Unit[], budget: number): Promise<string> {
+  const jobs = units.flatMap((unit) => {
+    const parts = splitTurns(unit.turns, budget);
+    if (parts.length === 0) return [{ heading: unit.title, text: '' }];
+    return parts.map((text, i) => ({
+      heading: parts.length > 1 ? `${unit.title} (del ${i + 1}/${parts.length})` : unit.title,
+      text,
+    }));
+  });
+
+  const summaries = await mapWithLimit(jobs, SUMMARY_CONCURRENCY, (job) =>
+    job.text ? _summarizePart(job.text, job.heading) : Promise.resolve(''),
+  );
+  return jobs.map((job, i) => `## ${job.heading}\n${summaries[i]}`).join('\n\n');
 }
 
 /**
  * Generate a referat as a single markdown document, driven by a Skabelon.
  *
- * For long, chaptered transcripts the chapters are summarised first and the
- * referat is written from those summaries, keeping the request within budget.
+ * The transcript is merged into speaker turns and measured against a character budget
+ * derived from the model's context window (LLM_CONTEXT_TOKENS / LLM_MAX_OUTPUT_TOKENS).
+ * If it fits, one call writes the referat. Otherwise the transcript is summarised in
+ * parts and the referat is written from those summaries, so a long meeting never
+ * overflows the window or comes back cut off.
  */
 export async function generateReferatBody(
   transcript: TranscriptSegment[],
@@ -177,29 +187,76 @@ export async function generateReferatBody(
   chapters?: TranscriptChapter[],
   customPrompt?: string,
 ): Promise<{ body: string }> {
-  const transcriptText = mergeConsecutiveSpeakerTurns(transcript)
-    .map((s) => `[${s.speaker}] (${formatTime(s.start)}): ${s.text}`)
-    .join('\n');
+  const t0 = Date.now();
   const instruction = buildSkabelonInstruction(spec, participants, customPrompt);
 
-  if (chapters && chapters.length > 1 && transcriptText.length > TRANSCRIPT_CHAR_BUDGET) {
-    const summaries = await Promise.all(
-      chapters.map((ch) => {
-        const chapterSegments = ch.segmentIndices.map((i) => transcript[i]).filter(Boolean);
-        return _summarizeChapter(chapterSegments, ch.title);
-      }),
+  const limits = getLlmLimits();
+  const turns = mergeSpeakerTurns(transcript);
+  const transcriptText = renderTurns(turns);
+  const fixedPromptText = MINUTES_SYSTEM_PROMPT + buildBodyPrompt('', instruction);
+  const budget = await transcriptBudgetChars(fixedPromptText, transcriptText, limits);
+  if (budget < MIN_TRANSCRIPT_BUDGET_CHARS) {
+    throw new MinutesConfigError(
+      `LLM_CONTEXT_TOKENS=${limits.contextTokens} leaves ${Math.max(budget, 0)} characters for the ` +
+        `transcript after reserving ${limits.maxOutputTokens} output tokens ` +
+        `(minimum ${MIN_TRANSCRIPT_BUDGET_CHARS}). Raise LLM_CONTEXT_TOKENS or lower LLM_MAX_OUTPUT_TOKENS.`,
     );
-    const condensed = chapters.map((ch, i) => `## ${ch.title}\n${summaries[i]}`).join('\n\n');
-    const body = await _generateBody(condensed, instruction);
+  }
+
+  // _summarizePart always requests SUMMARY_MAX_OUTPUT_TOKENS, not limits.maxOutputTokens
+  // (a summary needs far less room than the final referat) — so the parts it is fed have
+  // to be sized against that smaller reservation, not `budget`, or the prompt plus the
+  // summary's own output can together exceed the real context window.
+  const summaryFixedText = buildSummaryPrompt('', '');
+  const summaryBudget = await transcriptBudgetChars(summaryFixedText, transcriptText, {
+    contextTokens: limits.contextTokens,
+    maxOutputTokens: SUMMARY_MAX_OUTPUT_TOKENS,
+  });
+  if (summaryBudget < MIN_TRANSCRIPT_BUDGET_CHARS) {
+    throw new MinutesConfigError(
+      `LLM_CONTEXT_TOKENS=${limits.contextTokens} leaves too little room for even a part-summary ` +
+        `call (reserving ${SUMMARY_MAX_OUTPUT_TOKENS} output tokens). Raise LLM_CONTEXT_TOKENS.`,
+    );
+  }
+
+  const chapterList = chapters && chapters.length > 1 ? chapters : null;
+  const log = (mode: string, rounds: number) =>
+    console.log(
+      `[minutes] chars=${transcriptText.length} budget=${budget} mode=${mode} rounds=${rounds} ms=${Date.now() - t0}`,
+    );
+
+  if (
+    transcriptText.length <= budget &&
+    !(chapterList !== null && transcriptText.length > CHAPTER_SPLIT_THRESHOLD)
+  ) {
+    const body = await _generateBody(transcriptText, instruction, limits.maxOutputTokens);
+    log('single', 0);
     return { body };
   }
 
-  const body = await _generateBody(transcriptText, instruction);
-  return { body };
-}
+  const units: Unit[] = chapterList
+    ? chapterList.map((ch) => ({
+        title: ch.title,
+        turns: mergeSpeakerTurns(ch.segmentIndices.map((i) => transcript[i]).filter(Boolean)),
+      }))
+    : [{ title: 'Mødet', turns }];
 
-function formatTime(seconds: number): string {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${s.toString().padStart(2, '0')}`;
+  let rounds = 1;
+  let condensed = await _summarizeUnits(units, summaryBudget);
+  while (condensed.length > budget) {
+    if (rounds >= MAX_SUMMARY_ROUNDS) {
+      throw new MinutesTooLongError(
+        `Still ${condensed.length} characters (budget ${budget}) after ${rounds} summarise rounds`,
+      );
+    }
+    rounds++;
+    condensed = await _summarizeUnits(
+      [{ title: 'Opsummering', turns: [{ speaker: 'Resumé', start: 0, text: condensed }] }],
+      summaryBudget,
+    );
+  }
+
+  const body = await _generateBody(condensed, instruction, limits.maxOutputTokens);
+  log('split', rounds);
+  return { body };
 }
