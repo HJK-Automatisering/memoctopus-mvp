@@ -28,12 +28,6 @@ jobs:
               NEXT_PUBLIC_APP_URL=https://referat.ai.hjoerring.local
               NEXT_PUBLIC_DIARIZATION_TIMEOUT_MS=3600000
 
-          - name: bot-service
-            image: memoctopus-bot-service
-            context: ./bot-service
-            file: ./bot-service/Dockerfile
-            build_args: ''
-
           - name: diarization-service
             image: memoctopus-diarization-service
             context: ./diarization-service
