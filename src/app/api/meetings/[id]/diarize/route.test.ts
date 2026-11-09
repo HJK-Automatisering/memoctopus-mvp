@@ -15,7 +15,8 @@ vi.mock('@/lib/ai/diarization', () => ({
 }));
 
 import { NextRequest } from 'next/server';
-import { POST, DIARIZE_PING_INTERVAL_MS } from './route';
+import { POST } from './route';
+import { DIARIZE_PING_INTERVAL_MS } from '@/lib/audio/diarize-stream';
 import { auth } from '@/lib/auth';
 import { FAKE_SESSION } from '@/test/helpers';
 

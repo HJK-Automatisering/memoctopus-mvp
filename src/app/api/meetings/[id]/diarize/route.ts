@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { headers } from 'next/headers';
 import { auth } from '@/lib/auth';
 import { getDiarizationProvider } from '@/lib/ai/diarization';
+import { DIARIZE_PING_INTERVAL_MS } from '@/lib/audio/diarize-stream';
 
 interface Params {
   params: Promise<{ id: string }>;
@@ -15,8 +16,6 @@ interface Params {
 // minutes each time. The response is therefore an NDJSON stream that emits a
 // ping while waiting, so bytes keep flowing end to end — the same reason the
 // transcribe-batches route streams.
-export const DIARIZE_PING_INTERVAL_MS = 15_000;
-
 type DiarizeEvent =
   | { type: 'ping' }
   | { type: 'done'; turns: unknown[] }
